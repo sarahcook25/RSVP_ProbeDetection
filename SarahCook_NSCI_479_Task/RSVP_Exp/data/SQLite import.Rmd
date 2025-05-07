@@ -1,0 +1,342 @@
+---
+title: "RSQLite import"
+---
+
+```{r, echo=FALSE, message=FALSE}
+# Load packages
+install.packages("pacman")
+require('pacman')
+p_load('RSQLite', 'jsonlite', 'tidyverse', 'janitor')
+library(magrittr)
+```
+
+Import data from SQLite file
+----------------------------
+
+```{r}
+# 'Connect' to database
+con <- dbConnect(
+  drv=RSQLite::SQLite(),
+  dbname='data.sqlite'
+)
+
+# Extract main table
+d <- dbGetQuery(
+  conn=con,
+  statement='SELECT * FROM labjs'
+)
+
+# Close connection
+dbDisconnect(
+  conn=con
+)
+
+# Discard connection
+rm(con)
+```
+
+Convert JSON data to table
+--------------------------
+
+###Extract metadata
+
+```{r}
+library(dplyr)
+library(purrr)
+library(jsonlite)
+
+d.meta <- map_dfr(d$metadata, ~ {
+  meta_row <- fromJSON(.x)
+  meta_row <- as_tibble(meta_row)
+  meta_row$observation <- meta_row$id     # observation from metadata id
+  meta_row
+})
+
+d <- d %>%
+  bind_cols(d.meta) %>%
+  select(
+    -metadata # Remove metadata column
+  )
+
+# Remove temporary data frame
+#rm(d.meta)
+
+library(dplyr)
+
+filtered_df <- d %>%
+  # Keep rows where timestamp starts with '2025'
+  filter(startsWith(timestamp, "2025")) %>%
+  # Count how many times each observation appears
+  add_count(observation) %>%
+  # Keep only rows where observation appears more than once
+  filter(n > 10) %>%
+  select(-n)  # Remove the count column if not needed
+
+# View result
+print(filtered_df)
+
+```
+
+###Shorten the random ids
+
+```{r}
+count_unique <- function(x) {
+  return(length(unique(x)))
+}
+
+information_preserved <- function(x, length) {
+  return(
+    count_unique(str_sub(x, end=i)) ==
+    count_unique(x)
+  )
+}
+
+# Figure out the length of the random ids needed
+# to preserve the information therein. (five characters
+# should usually be enougth, but better safe)
+for (i in 5:36) {
+  if (
+    information_preserved(d$session, i) &&
+    information_preserved(d$observation, i)
+  ) {
+    break()
+  }
+}
+
+d <- d %>%
+  dplyr::mutate(
+    session=str_sub(session, end=i),
+    observation=str_sub(observation, end=20) #change this to 20
+  )
+
+rm(i, count_unique, information_preserved)
+```
+
+
+###Prepare to extract JSON data
+
+```{r}
+parseJSON <- function(input) {
+  return(input %>%
+    fromJSON(flatten=T) %>% {
+    # Coerce lists
+    if (class(.) == 'list') {
+      discard(., is.null) %>%
+      as_tibble()
+    } else {
+      .
+    } } %>%
+    # Sanitize names
+    janitor::clean_names() %>%
+    # Use only strings for now, and re-encode types later
+    mutate_all(as.character)
+  )
+}
+```
+
+
+###Extract complete data sets
+
+```{r}
+d.full <- d %>%
+  dplyr::filter(payload == 'full')
+
+if (nrow(d.full) > 0) {
+  d.full %>%
+    group_by(observation, id) %>%
+    do(
+      { map_dfr(.$data, parseJSON) } %>%
+      bind_rows()
+    ) %>%
+    ungroup() %>%
+    select(-id) -> d.full
+} else {
+  # If there are no full datasets, start from an entirely empty df
+  # in order to avoid introducing unwanted columns into the following
+  # merge steps.
+  d.full <- tibble()
+  d.full$observation <- c()
+}
+```
+
+###Extract incremental data sets
+
+```{r}
+filtered_df %>%
+  dplyr::filter(payload %in% c('incremental', 'latest')) %>%
+  group_by(observation) %>%
+  do(
+    { map_dfr(.$data, parseJSON) } %>%
+    bind_rows()
+  ) %>%
+  ungroup() -> d.incremental
+```
+
+----
+
+###Merge data sets
+
+For analysis, we'll use the full data sets where available, and incremental data when it is the the only information we have for a user.
+
+```{r}
+d.output <- d.incremental %>%
+  bind_rows(
+    d.incremental %>% filter(!(observation %in% d.incremental$observation))
+  ) %>%
+  type_convert()
+```
+
+###Postprocessing
+
+It would be nice if some columns were completed so that all cells contain the same value, even if only a subset is filled
+
+```{r}
+d.incremental %>%
+  group_by(observation) %>%
+  fill(matches('code'), .direction='down') %>%
+  fill(matches('code'), .direction='up') %>%
+  ungroup() -> d.incremental
+```
+
+Remove sensitive data
+
+```{r}
+# d.output <- d.output %>%
+ #  select(
+  #   -matches('Email')
+  # )
+```
+
+Remove invalid columns
+
+```{r}
+# d.output %>%
+#   select_if(function(col) class(col) != 'list') -> d.output
+```
+
+
+
+
+###Export data
+
+Write data back to disk in csv format.
+
+```{r}
+
+
+# Apply mapping
+d.output$duration <- sapply(d.output$duration, function(x) {
+  if (is.na(x)) {
+    return(NA)  # Keep NA as NA
+  } else if (x >= 32 & x <= 35) {
+    return(34)
+  } else if (x >= 82 & x <= 85) {
+    return(84)
+  } else if (x >= 165 & x <= 168) {
+    return(167)
+  } else {
+    return(x)
+  }
+})
+
+# Loop through the rows of the dataframe
+for (i in 3:nrow(d.output)) {  # Start from row 3 to avoid index out of bounds
+  if (d.output$sender[i] == "Test_no_img") {
+    d.output$duration[i] <- d.output$duration[i - 3]  
+  }
+  if (d.output$sender[i] == "Test_probe") {
+    d.output$duration[i] <- d.output$duration[i - 4]  
+  }
+}
+
+
+library(dplyr)
+
+# Given dataframe
+df.output <- d.output
+
+# List of columns to keep
+cols_to_keep <- c("sender", "observation", "timestamp", "is_probe", "trial_type", "response", "response_action", "target_img_1", "target_img_2", "target_img_3", "target_img_4", "target_img_5", "target_img_6", "probesize0", "probesize1", "probesize2", "probesize3", "probesize4", "probesize5", "probe_left", "probe_top", "condition", "sub_seq", "duration")
+
+# Keep only these columns
+df_filtered <- df.output %>% select(all_of(cols_to_keep))
+
+# Assume your dataframe is called df and the timestamp column is called 'timestamp'
+df_filtered <- df_filtered %>%
+  mutate(timestamp = as.POSIXct(timestamp, format = "%Y-%m-%d %H:%M:%S")) %>%
+  arrange(timestamp)
+
+write_csv(df_filtered, 'output_5_4_824.csv')
+
+# Load required library
+library(dplyr)
+
+# --- Step 1: Prepare memorability table ---
+# Example: read memorability table from CSV
+# This table has columns: index, hit_rate, false_alarm_rate
+memorability_table <- read.csv("target_info.csv")
+
+# Calculate memorability
+memorability_table <- memorability_table %>%
+  mutate(memorability = hit - fa)
+
+# --- Step 2: Prepare the target image table ---
+# Example: read target table from CSV
+# This table has columns: target_img_1, target_img_2, ..., target_img_6
+target_table <- read.csv("output_5_4_824.csv")
+
+# Ensure Index is character for matching
+memorability_table$im_ind <- as.character(memorability_table$im_ind)
+
+
+# Initialize Memorability column in the target table
+target_table$Memorability <- NA
+
+# Loop through rows of the target table
+for (i in 1:nrow(target_table)) {
+    mem_scores <- c()
+    
+    # Loop through each target image column (target_img_1 to target_img_6)
+    for (col in c("target_img_1", "target_img_2", "target_img_3", 
+                  "target_img_4", "target_img_5", "target_img_6")) {
+        
+        img_value <- target_table[[col]][i]
+        
+        # Skip empty or NA values and only consider '_T.jpg'
+        if (!is.na(img_value) && grepl("_T\\.jpg$", img_value)) {
+            # Extract the number before '_T.jpg'
+            number_part <- sub("_T\\.jpg$", "", img_value)
+            number_part <- as.character(as.numeric(number_part))  # Normalize format (remove leading zeros)
+            
+            # Match with memorability table based on Index
+            match_row <- memorability_table[memorability_table$im_ind == number_part, ]
+            
+            # Debug prints to verify matching
+            print(paste("Row", i, "Col", col, "Number:", number_part))
+            print(match_row)
+            
+            # If a match exists, add the memorability score
+            if (nrow(match_row) > 0) {
+                mem_scores <- c(mem_scores, match_row$Memorability[1])
+            }
+        }
+    }
+    
+    # If there are any valid memorability scores, calculate the mean
+    if (length(mem_scores) > 0) {
+        target_table$Memorability[i] <- mean(mem_scores, na.rm = TRUE)
+    }
+}
+
+                  
+# --- Optional: Save the updated table ---
+write.csv(target_table, "target_images_with_memorability.csv", row.names = FALSE)
+
+# Check if there are any non-NA values in, say, target_img_1_memorability
+sum(!is.na(target_table$Memorability))
+
+
+
+```
+
+
