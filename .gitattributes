@@ -1,0 +1,4 @@
+\# filter=lfs diff=lfs merge=lfs -text
+Tracks filter=lfs diff=lfs merge=lfs -text
+all filter=lfs diff=lfs merge=lfs -text
+files filter=lfs diff=lfs merge=lfs -text
